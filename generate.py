@@ -294,6 +294,10 @@ def _parse_args():
         default=80,
         help="Number of frames per clip, 48 or 80 or others (must be multiple of 4) for 14B s2v"
     )
+    parser.add_argument("--sliding_window", action="store_true", default=False)
+    parser.add_argument("--window_size", type=int, default=81)
+    parser.add_argument("--window_overlap", type=int, default=17)
+    parser.add_argument("--discard_last", type=int, default=0)
     args = parser.parse_args()
     _validate_args(args)
 
@@ -440,18 +444,36 @@ def generate(args):
         )
 
         logging.info(f"Generating video ...")
-        video = wan_ti2v.generate(
-            args.prompt,
-            img=img,
-            size=SIZE_CONFIGS[args.size],
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+        if args.sliding_window:
+            video = wan_ti2v.generate_sliding(
+                input_prompt=args.prompt,
+                img=img,
+                size=SIZE_CONFIGS[args.size],
+                max_area=MAX_AREA_CONFIGS[args.size],
+                total_frames=args.frame_num,
+                window_size=args.window_size,
+                overlap=args.window_overlap,
+                discard_last=args.discard_last,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model,
+            )
+        else:
+            video = wan_ti2v.generate(
+                args.prompt,
+                img=img,
+                size=SIZE_CONFIGS[args.size],
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
     elif "animate" in args.task:
         logging.info("Creating Wan-Animate pipeline.")
         wan_animate = wan.WanAnimate(

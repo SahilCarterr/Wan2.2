@@ -114,6 +114,31 @@ class WanTI2V:
             self.sp_size = 1
 
         self.sample_neg_prompt = config.sample_neg_prompt
+    @staticmethod
+    def _round_frames(frame_num, step=4):
+        return ((frame_num - 1) // step) * step + 1
+
+    def _resize_video_tensor(self, video, height, width):
+        # video: [C, F, H, W]
+        return torch.nn.functional.interpolate(
+            video.transpose(0, 1),
+            size=(height, width),
+            mode="bicubic",
+            align_corners=False,
+        ).transpose(0, 1)
+
+    def _encode_prefix_video(self, prefix_video, height, width):
+        # prefix_video: [C, F, H, W], expected in same value range as generated output.
+        prefix_video = prefix_video.to(self.device)
+        prefix_video = self._resize_video_tensor(prefix_video, height, width)
+        return self.vae.encode([prefix_video])[0]
+
+    def _make_prefix_mask(self, latent, prefix_latent_frames):
+        # mask value 0 = locked/conditioned latent, 1 = freely generated latent
+        mask = torch.ones_like(latent)
+        if prefix_latent_frames > 0:
+            mask[:, :prefix_latent_frames] = 0
+        return mask
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -158,6 +183,71 @@ class WanTI2V:
                 model.to(self.device)
 
         return model
+    
+
+
+    def generate_sliding(
+        self,
+        input_prompt,
+        img=None,
+        size=(1280, 704),
+        max_area=704 * 1280,
+        total_frames=241,
+        window_size=121,
+        overlap=17,
+        discard_last=0,
+        seed=-1,
+        **generate_kwargs,
+    ):
+        window_size = self._round_frames(window_size)
+        total_frames = self._round_frames(total_frames)
+        overlap = self._round_frames(overlap) if overlap > 1 else overlap
+
+        outputs = []
+        prefix_video = None
+        produced = 0
+        window_no = 0
+
+        while produced < total_frames:
+            window_no += 1
+
+            if window_no == 1:
+                current_window_size = min(window_size, total_frames)
+                prefix_frames_count = 0
+            else:
+                remaining = total_frames - produced
+                current_window_size = min(
+                    window_size,
+                    remaining + overlap + discard_last,
+                )
+                current_window_size = self._round_frames(current_window_size)
+                prefix_frames_count = overlap
+
+            sample = self.generate(
+                input_prompt=input_prompt,
+                img=img,
+                size=size,
+                max_area=max_area,
+                frame_num=current_window_size,
+                seed=seed + window_no if seed >= 0 else -1,
+                prefix_video=prefix_video,
+                prefix_frames_count=prefix_frames_count,
+                **generate_kwargs,
+            )
+
+            if discard_last > 0:
+                sample = sample[:, :-discard_last]
+
+            if window_no > 1 and overlap > 0:
+                sample = sample[:, overlap:]
+
+            outputs.append(sample)
+            produced += sample.shape[1]
+
+            prefix_video = torch.cat(outputs, dim=1)[:, -overlap:].detach()
+
+        return torch.cat(outputs, dim=1)[:, :total_frames]
+
 
     def generate(self,
                  input_prompt,
@@ -171,7 +261,10 @@ class WanTI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 prefix_video=None,
+                 prefix_frames_count=0,
+                 overlap_noise=0):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -212,6 +305,9 @@ class WanTI2V:
         # i2v
         if img is not None:
             return self.i2v(
+                prefix_video=prefix_video,
+                prefix_frames_count=prefix_frames_count,
+                overlap_noise=overlap_noise,
                 input_prompt=input_prompt,
                 img=img,
                 max_area=max_area,
@@ -225,6 +321,9 @@ class WanTI2V:
                 offload_model=offload_model)
         # t2v
         return self.t2v(
+            prefix_video=prefix_video,
+            prefix_frames_count=prefix_frames_count,
+            overlap_noise=overlap_noise,
             input_prompt=input_prompt,
             size=size,
             frame_num=frame_num,
@@ -246,7 +345,10 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
-            offload_model=True):
+            offload_model=True,
+            prefix_video=None,
+            prefix_frames_count=0,
+            overlap_noise=0):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -318,7 +420,23 @@ class WanTI2V:
                 device=self.device,
                 generator=seed_g)
         ]
+        prefix_latents = None
+        prefix_mask = None
+        prefix_latent_frames = 0
 
+        if prefix_video is not None and prefix_frames_count > 0:
+            prefix_video = prefix_video[:, -prefix_frames_count:]
+            prefix_latents = self._encode_prefix_video(
+                prefix_video,
+                height=size[1],
+                width=size[0],
+            )
+
+            prefix_latent_frames = min(prefix_latents.shape[1], noise[0].shape[1])
+            prefix_latents = prefix_latents[:, :prefix_latent_frames].to(noise[0])
+
+            prefix_mask = torch.ones_like(noise[0])
+            prefix_mask[:, :prefix_latent_frames] = 0
         @contextmanager
         def noop_no_sync():
             yield
@@ -355,8 +473,12 @@ class WanTI2V:
 
             # sample videos
             latents = noise
-            mask1, mask2 = masks_like(noise, zero=False)
 
+            mask1, mask2 = masks_like(noise, zero=False)
+  
+            if prefix_mask is not None:
+                mask2 = [prefix_mask]
+                latents[0][:, :prefix_latent_frames] = prefix_latents
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
@@ -392,6 +514,8 @@ class WanTI2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
+                if prefix_latents is not None:
+                  latents[0][:, :prefix_latent_frames] = prefix_latents
             x0 = latents
             if offload_model:
                 self.model.cpu()
@@ -421,7 +545,10 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
-            offload_model=True):
+            offload_model=True,
+            prefix_video=None,
+            prefix_frames_count=0,
+            overlap_noise=0):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -509,7 +636,11 @@ class WanTI2V:
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
-        z = self.vae.encode([img])
+        if prefix_video is not None and prefix_frames_count > 0:
+          prefix_video = prefix_video[:, -prefix_frames_count:]
+          z = [self._encode_prefix_video(prefix_video, height=oh, width=ow)]
+        else:
+          z = self.vae.encode([img])
 
         @contextmanager
         def noop_no_sync():
@@ -548,6 +679,12 @@ class WanTI2V:
             # sample videos
             latent = noise
             mask1, mask2 = masks_like([noise], zero=True)
+
+            if prefix_video is not None and prefix_frames_count > 0:
+                prefix_latent_frames = min(z[0].shape[1], latent.shape[1])
+                z[0] = z[0][:, :prefix_latent_frames]
+                mask2 = [self._make_prefix_mask(latent, prefix_latent_frames)]
+
             latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
 
             arg_c = {
