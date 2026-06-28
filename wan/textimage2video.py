@@ -223,9 +223,17 @@ class WanTI2V:
                 current_window_size = self._round_frames(current_window_size)
                 prefix_frames_count = overlap
 
+            call_img = img
+
+            if window_no > 1 and call_img is None:
+                # Force generate() to route into i2v(), where prefix_video is used as conditioning.
+                last_frame = prefix_video[:, -1].detach().float().cpu()
+                last_frame = last_frame.clamp(-1, 1).add(1).mul(127.5).byte()
+                call_img = TF.to_pil_image(last_frame)
+
             sample = self.generate(
                 input_prompt=input_prompt,
-                img=img,
+                img=call_img,
                 size=size,
                 max_area=max_area,
                 frame_num=current_window_size,
@@ -685,7 +693,11 @@ class WanTI2V:
                 z[0] = z[0][:, :prefix_latent_frames]
                 mask2 = [self._make_prefix_mask(latent, prefix_latent_frames)]
 
-            latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+            
+            if prefix_video is not None and prefix_frames_count > 0:
+                latent[:, :prefix_latent_frames] = z[0]
+            else:
+                latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
 
             arg_c = {
                 'context': [context[0]],
@@ -732,7 +744,10 @@ class WanTI2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latent = temp_x0.squeeze(0)
-                latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+                if prefix_video is not None and prefix_frames_count > 0:
+                    latent[:, :prefix_latent_frames] = z[0]
+                else:
+                    latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
 
                 x0 = [latent]
                 del latent_model_input, timestep
