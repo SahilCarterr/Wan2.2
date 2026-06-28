@@ -121,6 +121,24 @@ class WanT2V:
             self.sp_size = 1
 
         self.sample_neg_prompt = config.sample_neg_prompt
+    
+    @staticmethod
+    def _round_frames(frame_num, step=4):
+        return ((frame_num - 1) // step) * step + 1
+
+    def _resize_video_tensor(self, video, height, width):
+        # video: [C, F, H, W]
+        return torch.nn.functional.interpolate(
+            video.transpose(0, 1),
+            size=(height, width),
+            mode="bicubic",
+            align_corners=False,
+        ).transpose(0, 1)
+
+    def _encode_prefix_video(self, prefix_video, height, width):
+        prefix_video = prefix_video.to(self.device)
+        prefix_video = self._resize_video_tensor(prefix_video, height, width)
+        return self.vae.encode([prefix_video])[0]
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -199,6 +217,64 @@ class WanT2V:
                     required_model_name).parameters()).device.type == 'cpu':
                 getattr(self, required_model_name).to(self.device)
         return getattr(self, required_model_name)
+    
+    def generate_sliding(
+        self,
+        input_prompt,
+        size=(1280, 720),
+        total_frames=241,
+        window_size=81,
+        overlap=17,
+        discard_last=0,
+        seed=-1,
+        **generate_kwargs,
+    ):
+        window_size = self._round_frames(window_size)
+        total_frames = self._round_frames(total_frames)
+        overlap = self._round_frames(overlap) if overlap > 1 else overlap
+
+        outputs = []
+        prefix_video = None
+        produced = 0
+        window_no = 0
+
+        while produced < total_frames:
+            window_no += 1
+
+            if window_no == 1:
+                current_window_size = min(window_size, total_frames)
+                prefix_frames_count = 0
+            else:
+                remaining = total_frames - produced
+                current_window_size = min(
+                    window_size,
+                    remaining + overlap + discard_last,
+                )
+                current_window_size = self._round_frames(current_window_size)
+                prefix_frames_count = overlap
+
+            sample = self.generate(
+                input_prompt=input_prompt,
+                size=size,
+                frame_num=current_window_size,
+                seed=seed + window_no if seed >= 0 else -1,
+                prefix_video=prefix_video,
+                prefix_frames_count=prefix_frames_count,
+                **generate_kwargs,
+            )
+
+            if discard_last > 0:
+                sample = sample[:, :-discard_last]
+
+            if window_no > 1 and overlap > 0:
+                sample = sample[:, overlap:]
+
+            outputs.append(sample)
+            produced += sample.shape[1]
+
+            prefix_video = torch.cat(outputs, dim=1)[:, -overlap:].detach()
+
+        return torch.cat(outputs, dim=1)[:, :total_frames]
 
     def generate(self,
                  input_prompt,
@@ -210,7 +286,9 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 prefix_video=None,
+                 prefix_frames_count=0):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -286,6 +364,19 @@ class WanT2V:
                 device=self.device,
                 generator=seed_g)
         ]
+        prefix_latents = None
+        prefix_latent_frames = 0
+
+        if prefix_video is not None and prefix_frames_count > 0:
+            prefix_video = prefix_video[:, -prefix_frames_count:]
+            prefix_latents = self._encode_prefix_video(
+                prefix_video,
+                height=size[1],
+                width=size[0],
+            )
+
+            prefix_latent_frames = min(prefix_latents.shape[1], noise[0].shape[1])
+            prefix_latents = prefix_latents[:, :prefix_latent_frames].to(noise[0])
 
         @contextmanager
         def noop_no_sync():
@@ -333,6 +424,9 @@ class WanT2V:
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
             for _, t in enumerate(tqdm(timesteps)):
+                if prefix_latents is not None:
+                    latents[0][:, :prefix_latent_frames] = prefix_latents
+
                 latent_model_input = latents
                 timestep = [t]
 
@@ -358,6 +452,8 @@ class WanT2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
+                if prefix_latents is not None:
+                    latents[0][:, :prefix_latent_frames] = prefix_latents
 
             x0 = latents
             if offload_model:
