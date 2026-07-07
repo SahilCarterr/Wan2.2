@@ -28,7 +28,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-from .utils.utils import best_output_size, masks_like
+from .utils.utils import best_output_size, masks_like, save_video
 
 
 class WanTI2V:
@@ -186,6 +186,31 @@ class WanTI2V:
     
 
 
+    def _get_scheduled_prompt(self, base_prompt, prompt_schedule, frame_idx):
+        """
+        Window-level prompt scheduling.
+
+        prompt_schedule format:
+        [
+            (0, "first prompt"),
+            (225, "second prompt"),
+            (433, "third prompt"),
+        ]
+        """
+        if not prompt_schedule:
+            return base_prompt
+
+        active_prompt = base_prompt
+        for start_frame, prompt in prompt_schedule:
+            if frame_idx >= start_frame:
+                active_prompt = prompt
+            else:
+                break
+
+        return active_prompt
+
+
+
     def generate_sliding(
         self,
         input_prompt,
@@ -197,6 +222,7 @@ class WanTI2V:
         overlap=17,
         discard_last=0,
         seed=-1,
+        prompt_schedule=None,
         **generate_kwargs,
     ):
         window_size = self._round_frames(window_size)
@@ -231,8 +257,32 @@ class WanTI2V:
                 last_frame = last_frame.clamp(-1, 1).add(1).mul(127.5).byte()
                 call_img = TF.to_pil_image(last_frame)
 
+            current_start_frame = produced
+
+            while produced < total_frames:
+                window_no += 1
+                current_start_frame = produced
+
+                if window_no == 1:
+                    current_window_size = min(window_size, total_frames)
+                    prefix_frames_count = 0
+                else:
+                    remaining = total_frames - produced
+                    current_window_size = min(
+                        window_size,
+                        remaining + overlap + discard_last,
+                    )
+                    current_window_size = self._round_frames(current_window_size)
+                    prefix_frames_count = overlap
+
+            window_prompt = self._get_scheduled_prompt(
+                input_prompt,
+                prompt_schedule,
+                current_start_frame
+            )
+
             sample = self.generate(
-                input_prompt=input_prompt,
+                input_prompt=window_prompt,
                 img=call_img,
                 size=size,
                 max_area=max_area,

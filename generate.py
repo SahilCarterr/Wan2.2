@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import argparse
+import json
 import logging
 import os
 import sys
@@ -58,6 +59,37 @@ EXAMPLE_PROMPT = {
     },
 }
 
+def _load_prompt_schedule(prompt_schedule):
+    if not prompt_schedule:
+        return None
+
+    if os.path.exists(prompt_schedule):
+        with open(prompt_schedule, "r") as f:
+            data = json.load(f)
+    else:
+        data = json.loads(prompt_schedule)
+
+    schedule = []
+
+    if isinstance(data, dict):
+        for frame, prompt in data.items():
+            schedule.append((int(frame), str(prompt)))
+
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                frame = item.get("frame", item.get("start_frame"))
+                prompt = item["prompt"]
+                schedule.append((int(frame), str(prompt)))
+            else:
+                frame, prompt = item
+                schedule.append((int(frame), str(prompt)))
+
+    else:
+        raise ValueError("prompt_schedule must be a JSON dict or list.")
+
+    schedule.sort(key=lambda x: x[0])
+    return schedule
 
 def _validate_args(args):
     # Basic check
@@ -298,6 +330,12 @@ def _parse_args():
     parser.add_argument("--window_size", type=int, default=81)
     parser.add_argument("--window_overlap", type=int, default=17)
     parser.add_argument("--discard_last", type=int, default=0)
+    parser.add_argument(
+        "--prompt_schedule",
+        type=str,
+        default=None,
+        help="JSON file path or JSON string for window-level prompt scheduling."
+    )
     args = parser.parse_args()
     _validate_args(args)
 
@@ -361,6 +399,18 @@ def generate(args):
         else:
             raise NotImplementedError(
                 f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
+        
+        
+    prompt_schedule = _load_prompt_schedule(args.prompt_schedule)
+
+    if prompt_schedule is not None:
+        if prompt_schedule[0][0] != 0:
+            prompt_schedule.insert(0, (0, args.prompt))
+
+        args.prompt = prompt_schedule[0][1]
+        logging.info(f"Using prompt schedule: {prompt_schedule}")
+    
+    logging.info(f"Extended prompt: {args.prompt}")
 
     cfg = WAN_CONFIGS[args.task]
     if args.ulysses_size > 1:
@@ -460,7 +510,7 @@ def generate(args):
 
         logging.info(f"Generating video ...")
         if args.sliding_window:
-            video = wan_ti2v.generate_sliding(
+                video = wan_ti2v.generate_sliding(
                 input_prompt=args.prompt,
                 img=img,
                 size=SIZE_CONFIGS[args.size],
@@ -469,13 +519,14 @@ def generate(args):
                 window_size=args.window_size,
                 overlap=args.window_overlap,
                 discard_last=args.discard_last,
+                prompt_schedule=prompt_schedule,
                 shift=args.sample_shift,
                 sample_solver=args.sample_solver,
                 sampling_steps=args.sample_steps,
                 guide_scale=args.sample_guide_scale,
                 seed=args.base_seed,
                 offload_model=args.offload_model,
-            )
+                )
         else:
             video = wan_ti2v.generate(
                 args.prompt,
