@@ -336,6 +336,12 @@ def _parse_args():
         default=None,
         help="JSON file path or JSON string for window-level prompt scheduling."
     )
+    parser.add_argument(
+        "--negative_prompt",
+        type=str,
+        default="",
+        help="Negative prompt to avoid unwanted video artifacts."
+    )
     args = parser.parse_args()
     _validate_args(args)
 
@@ -514,6 +520,7 @@ def generate(args):
         if args.sliding_window:
                 video = wan_ti2v.generate_sliding(
                 input_prompt=args.prompt,
+                n_prompt=args.negative_prompt
                 img=img,
                 size=SIZE_CONFIGS[args.size],
                 max_area=MAX_AREA_CONFIGS[args.size],
@@ -532,6 +539,7 @@ def generate(args):
         else:
             video = wan_ti2v.generate(
                 args.prompt,
+                n_prompt=args.negative_prompt
                 img=img,
                 size=SIZE_CONFIGS[args.size],
                 max_area=MAX_AREA_CONFIGS[args.size],
