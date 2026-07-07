@@ -236,6 +236,7 @@ class WanTI2V:
 
         while produced < total_frames:
             window_no += 1
+            current_start_frame = produced
 
             if window_no == 1:
                 current_window_size = min(window_size, total_frames)
@@ -252,33 +253,14 @@ class WanTI2V:
             call_img = img
 
             if window_no > 1 and call_img is None:
-                # Force generate() to route into i2v(), where prefix_video is used as conditioning.
                 last_frame = prefix_video[:, -1].detach().float().cpu()
                 last_frame = last_frame.clamp(-1, 1).add(1).mul(127.5).byte()
                 call_img = TF.to_pil_image(last_frame)
 
-            current_start_frame = produced
-
-            while produced < total_frames:
-                window_no += 1
-                current_start_frame = produced
-
-                if window_no == 1:
-                    current_window_size = min(window_size, total_frames)
-                    prefix_frames_count = 0
-                else:
-                    remaining = total_frames - produced
-                    current_window_size = min(
-                        window_size,
-                        remaining + overlap + discard_last,
-                    )
-                    current_window_size = self._round_frames(current_window_size)
-                    prefix_frames_count = overlap
-
             window_prompt = self._get_scheduled_prompt(
                 input_prompt,
                 prompt_schedule,
-                current_start_frame
+                current_start_frame,
             )
 
             sample = self.generate(
@@ -302,7 +284,14 @@ class WanTI2V:
             outputs.append(sample)
             produced += sample.shape[1]
 
-            prefix_video = torch.cat(outputs, dim=1)[:, -overlap:].detach()
+            if overlap > 0:
+                prefix_video = torch.cat(outputs, dim=1)[:, -overlap:].detach()
+            else:
+                prefix_video = None
+
+            logging.info(
+                f"Sliding window {window_no}: produced {produced}/{total_frames} frames"
+            )
 
         return torch.cat(outputs, dim=1)[:, :total_frames]
 
