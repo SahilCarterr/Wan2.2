@@ -217,17 +217,34 @@ class WanT2V:
                     required_model_name).parameters()).device.type == 'cpu':
                 getattr(self, required_model_name).to(self.device)
         return getattr(self, required_model_name)
+
+
+    def _get_scheduled_prompt(self, base_prompt, prompt_schedule, frame_idx):
+        if not prompt_schedule:
+            return base_prompt
+
+        active_prompt = base_prompt
+        for start_frame, prompt in prompt_schedule:
+            if frame_idx >= start_frame:
+                active_prompt = prompt
+            else:
+                break
+
+        return active_prompt
+
+
     
     def generate_sliding(
-        self,
-        input_prompt,
-        size=(1280, 720),
-        total_frames=241,
-        window_size=81,
-        overlap=17,
-        discard_last=0,
-        seed=-1,
-        **generate_kwargs,
+    self,
+    input_prompt,
+    size=(1280, 720),
+    total_frames=241,
+    window_size=121,
+    overlap=17,
+    discard_last=0,
+    seed=-1,
+    prompt_schedule=None,
+    **generate_kwargs,
     ):
         window_size = self._round_frames(window_size)
         total_frames = self._round_frames(total_frames)
@@ -240,6 +257,7 @@ class WanT2V:
 
         while produced < total_frames:
             window_no += 1
+            current_start_frame = produced
 
             if window_no == 1:
                 current_window_size = min(window_size, total_frames)
@@ -253,8 +271,14 @@ class WanT2V:
                 current_window_size = self._round_frames(current_window_size)
                 prefix_frames_count = overlap
 
+            window_prompt = self._get_scheduled_prompt(
+                input_prompt,
+                prompt_schedule,
+                current_start_frame,
+            )
+
             sample = self.generate(
-                input_prompt=input_prompt,
+                input_prompt=window_prompt,
                 size=size,
                 frame_num=current_window_size,
                 seed=seed + window_no if seed >= 0 else -1,
@@ -272,7 +296,14 @@ class WanT2V:
             outputs.append(sample)
             produced += sample.shape[1]
 
-            prefix_video = torch.cat(outputs, dim=1)[:, -overlap:].detach()
+            if overlap > 0:
+                prefix_video = torch.cat(outputs, dim=1)[:, -overlap:].detach()
+            else:
+                prefix_video = None
+
+            logging.info(
+                f"Sliding window {window_no}: produced {produced}/{total_frames} frames"
+            )
 
         return torch.cat(outputs, dim=1)[:, :total_frames]
 

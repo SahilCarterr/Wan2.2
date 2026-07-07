@@ -476,6 +476,8 @@ def generate(args):
                 total_frames=args.frame_num,
                 window_size=args.window_size,
                 overlap=args.window_overlap,
+                discard_last=args.discard_last,
+                prompt_schedule=prompt_schedule,
                 shift=args.sample_shift,
                 sample_solver=args.sample_solver,
                 sampling_steps=args.sample_steps,
