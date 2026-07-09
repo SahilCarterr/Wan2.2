@@ -520,7 +520,7 @@ def generate(args):
         if args.sliding_window:
                 video = wan_ti2v.generate_sliding(
                 input_prompt=args.prompt,
-                n_prompt=args.negative_prompt
+                n_prompt=args.negative_prompt,
                 img=img,
                 size=SIZE_CONFIGS[args.size],
                 max_area=MAX_AREA_CONFIGS[args.size],
@@ -539,7 +539,7 @@ def generate(args):
         else:
             video = wan_ti2v.generate(
                 args.prompt,
-                n_prompt=args.negative_prompt
+                n_prompt=args.negative_prompt,
                 img=img,
                 size=SIZE_CONFIGS[args.size],
                 max_area=MAX_AREA_CONFIGS[args.size],
